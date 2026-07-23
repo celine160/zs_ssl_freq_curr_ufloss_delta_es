@@ -74,13 +74,3 @@ python plot_early_stopping.py --base_dir saved_models_file_brain_...
 This yields `early_stopping_metrics_plot.png`.
 
 ---
-
-### Manual Training
-ZS-SSL training and reconstruction can also be performed interactively by running `zs_ssl_recon.ipynb`. Prior to running training file, hyperparameters such as number of unrolled blocks, split ratio for validation, training and loss masks can be adjusted from `parser_ops.py`. If ZS-SSL training has been done, `zs_ssl_inference.ipynb` can be directly used for reconstruction.
-
-We highly recommend the users to set the outer k-space regions with no signal as 1 in training mask to ensure consistency with acquired measurements. Please refer to our [SSDU](https://github.com/byaman14/SSDU) repository for further details.
-
-
-## Early Automated Stopping
-In `parser_ops.py`, we have also defined a parameter (`--stop_training`) to automatically stop the training process. The `--stop_training` parameter denotes the number of consecutive epochs without achieving a lower validation loss (to disable early automated stopping, set `--stop_training` to  the number of epochs). 
-es, please open an issue or reach out to me at yaman013 at umn.edu .
