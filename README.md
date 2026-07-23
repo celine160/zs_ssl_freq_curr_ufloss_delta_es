@@ -1,9 +1,4 @@
-# ZS-SSL: Zero-Shot Self-Supervised Learning
-:triangular_flag_on_post:**PyTorch**: This is the pytorch implementation of ZS-SSL in the following ICLR paper: [Zero-Shot Self-Supervised Learning for MRI Reconstruction](https://openreview.net/forum?id=085y6YPaYjP).  
-
-:triangular_flag_on_post:**Tensorflow**: For  tensorflow (original) implementation please visit ([zs-ssl-tensorflow-implementation](https://github.com/byaman14/ZS-SSL)).
-
-:triangular_flag_on_post: If you find our work is helpful for you, please star this repo and [cite](#citelink) our paper 
+# ZS-SSL: Zero-Shot Self-Supervised Learning Extension
 
 ## ZS-SSL Overview
 ZS-SSL enables physics-guided deep learning MRI reconstruction using only a single slice/sample ([paper](https://openreview.net/forum?id=085y6YPaYjP)).
@@ -88,24 +83,4 @@ We highly recommend the users to set the outer k-space regions with no signal as
 
 ## Early Automated Stopping
 In `parser_ops.py`, we have also defined a parameter (`--stop_training`) to automatically stop the training process. The `--stop_training` parameter denotes the number of consecutive epochs without achieving a lower validation loss (to disable early automated stopping, set `--stop_training` to  the number of epochs). 
-
-## <span id="citelink">Citation</span>
-If you find the codes useful in your research, please cite
-```
-@inproceedings{
-yaman2022zeroshot,
-title={Zero-Shot Self-Supervised Learning for {MRI} Reconstruction},
-author={Burhaneddin Yaman and Seyed Amir Hossein Hosseini and Mehmet Akcakaya},
-booktitle={International Conference on Learning Representations},
-year={2022},
-url={https://openreview.net/forum?id=085y6YPaYjP}
-}
-```
-
-## Copyright & License Notice
-© 2021 Regents of the University of Minnesota
-
-ZS-SSL is copyrighted by Regents of the University of Minnesota and covered by US 17/075,411. Regents of the University of Minnesota will license the use of ZS-SSL solely for educational and research purposes by non-profit institutions and US government agencies only. For other proposed uses, contact umotc@umn.edu. The software may not be sold or redistributed without prior approval. One may make copies of the software for their use provided that the copies, are not sold or distributed, are used under the same terms and conditions. As unestablished research software, this code is provided on an "as is'' basis without warranty of any kind, either expressed or implied. The downloading, or executing any part of this software constitutes an implicit agreement to these terms. These terms and conditions are subject to change at any time without prior notice.
-
-## Questions
-If you have questions or issues, please open an issue or reach out to me at yaman013 at umn.edu .
+es, please open an issue or reach out to me at yaman013 at umn.edu .
