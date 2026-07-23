@@ -2,12 +2,13 @@ import torch
 import torch.nn as nn
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self,trn_atb, trn_mask, loss_mask, sens_maps, ref_kspace):
+    def __init__(self,trn_atb, trn_mask, loss_mask, sens_maps, ref_kspace, pseudo_target=None):
         self.trn_atb = trn_atb
         self.trn_mask = trn_mask
         self.loss_mask = loss_mask
         self.sens_maps = sens_maps
         self.ref_kspace = ref_kspace
+        self.pseudo_target = pseudo_target
         
     def __len__(self):
         return len(self.trn_atb)
@@ -23,6 +24,10 @@ class Dataset(torch.utils.data.Dataset):
         nw_loss_mask = torch.tensor(loss_mask, dtype = torch.complex64)
         sens_maps = torch.tensor(sens_maps, dtype = torch.complex64)
         ref_kspace = torch.tensor(ref_kspace, dtype = torch.float64)
+
+        if self.pseudo_target is not None:
+            pseudo_target = torch.tensor(self.pseudo_target[idx], dtype=torch.float64)
+            return nw_input, nw_trn_mask, nw_loss_mask, sens_maps, ref_kspace, pseudo_target
 
         return nw_input, nw_trn_mask, nw_loss_mask, sens_maps, ref_kspace
 
@@ -62,11 +67,19 @@ class MixL1L2Loss(nn.Module):
         
         return loss
 
-def train(train_loader, model, loss_fn, optimizer, device = torch.device('cpu')):
+def train(train_loader, model, loss_fn, optimizer, device = torch.device('cpu'), model_ufloss=None, alpha=0.1, image_scale=1.0):
     avg_trn_cost = 0
+    avg_kspace_cost = 0
+    avg_ufloss_cost = 0
     model.train()
     for ii,batch in enumerate(train_loader):
-        nw_input,nw_trn_mask,nw_loss_mask,nw_sens_maps,nw_ref_kspace= batch
+        if len(batch) == 6:
+            nw_input,nw_trn_mask,nw_loss_mask,nw_sens_maps,nw_ref_kspace,nw_pseudo_target = batch
+            nw_pseudo_target = nw_pseudo_target.permute(0,3,1,2).to(device).float()
+        else:
+            nw_input,nw_trn_mask,nw_loss_mask,nw_sens_maps,nw_ref_kspace= batch
+            nw_pseudo_target = None
+            
         nw_input= nw_input.permute(0,3,1,2)
 
         nw_input, nw_trn_mask, nw_loss_mask, nw_sens_maps, nw_ref_kspace = \
@@ -76,22 +89,40 @@ def train(train_loader, model, loss_fn, optimizer, device = torch.device('cpu'))
         nw_img_output, lamdas,nw_kspace_output = model(nw_input,nw_trn_mask,nw_loss_mask,nw_sens_maps)
         
         """Loss"""
-        trn_loss =loss_fn(nw_kspace_output,nw_ref_kspace)
+        kspace_loss = loss_fn(nw_kspace_output, nw_ref_kspace)
+        trn_loss = kspace_loss
         
+        raw_ufloss_val = 0.0
+        
+        """UFLoss"""
+        if model_ufloss is not None and nw_pseudo_target is not None and alpha > 0:
+            features_out = model_ufloss((nw_img_output / image_scale).float())[0]
+            features_target = model_ufloss((nw_pseudo_target / image_scale).float())[0].detach()
+            ufloss = nn.MSELoss()(features_out, features_target) / torch.mean(features_target ** 2)
+            raw_ufloss_val = ufloss.item()
+            trn_loss = trn_loss + alpha * ufloss
+            
         """Backpropagation"""
         optimizer.zero_grad()
         trn_loss.backward()
         optimizer.step()
 
         avg_trn_cost += trn_loss.item()/ len(train_loader)
-    return avg_trn_cost, lamdas
+        avg_kspace_cost += kspace_loss.item()/ len(train_loader)
+        avg_ufloss_cost += raw_ufloss_val / len(train_loader)
+        
+    return avg_trn_cost, avg_kspace_cost, avg_ufloss_cost, lamdas
 
 def validation(val_loader, model, loss_fn, device = torch.device('cpu')):
     avg_val_cost = 0
     model.eval()
     with torch.no_grad():
         for ii,batch in enumerate(val_loader):
-            nw_input,nw_trn_mask,nw_loss_mask,nw_sens_maps,nw_ref_kspace= batch
+            if len(batch) == 6:
+                nw_input,nw_trn_mask,nw_loss_mask,nw_sens_maps,nw_ref_kspace,nw_pseudo_target = batch
+            else:
+                nw_input,nw_trn_mask,nw_loss_mask,nw_sens_maps,nw_ref_kspace= batch
+                
             nw_input= nw_input.permute(0,3,1,2)
 
             nw_input, nw_trn_mask, nw_loss_mask, nw_sens_maps, nw_ref_kspace = \

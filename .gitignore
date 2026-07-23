@@ -1,2 +1,43 @@
+# Python ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+.DS_Store
+
+# Editor files
 *.swp
-__pycache__
+.idea/
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files
+data/
+*.mat
+*.h5
+
+# Saved Models & Outputs
+saved_models*/
+*.pth
+*.pt
+
+# Logs & Metrics
+*.txt
+*.log
+
+# Figures & Plots
+figs/
+*.png
+*.pdf
+
+# Scratch & Temporary Scripts
+scratch_*.py
+test_*.py

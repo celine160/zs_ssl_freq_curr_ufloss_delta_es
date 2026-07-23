@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+Convert fastMRI multicoil .h5 brain FLAIR data into .mat files for ZS-SSL-style reconstruction.
+
+Pipeline:
+1. Load fastMRI h5 file.
+2. Select one or more slices.
+3. Create Cartesian undersampling mask with 24 ACS center lines and nominal R=4.
+4. Estimate coil sensitivity maps using BART ESPIRiT.
+5. Apply undersampling mask to full k-space.
+6. Save everything into a .mat file.
+
+Requirements:
+    pip install h5py numpy scipy
+
+Also install BART and make sure the `bart` command is available in your terminal.
+
+Example:
+    python preprocess_fastmri_flair_to_zsssl_mat.py \
+        --input file1000000.h5 \
+        --output_dir ./processed_mat \
+        --acceleration 4 \
+        --acs_lines 24 \
+        --num_slices 5
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import h5py
+import numpy as np
+from scipy.io import savemat
+
+
+def ifft2c(kspace: np.ndarray) -> np.ndarray:
+    """Centered 2D inverse FFT."""
+    return np.fft.fftshift(
+        np.fft.ifft2(
+            np.fft.ifftshift(kspace, axes=(-2, -1)),
+            axes=(-2, -1),
+            norm="ortho",
+        ),
+        axes=(-2, -1),
+    )
+
+
+def rss_combine(coil_images: np.ndarray) -> np.ndarray:
+    """Root-sum-of-squares coil combination."""
+    return np.sqrt(np.sum(np.abs(coil_images) ** 2, axis=0))
+
+
+def create_uniform_mask(num_pe: int, acceleration: int = 4, acs_lines: int = 24) -> np.ndarray:
+    """
+    Create 1D uniform Cartesian undersampling mask.
+
+    Parameters
+    ----------
+    num_pe:
+        Number of phase-encoding lines.
+    acceleration:
+        Nominal acceleration factor.
+    acs_lines:
+        Number of fully sampled center ACS lines.
+
+    Returns
+    -------
+    mask:
+        1D binary mask of shape [num_pe].
+    """
+    mask = np.zeros(num_pe, dtype=np.float32)
+
+    center = num_pe // 2
+    acs_start = center - acs_lines // 2
+    acs_end = acs_start + acs_lines
+
+    mask[acs_start:acs_end] = 1.0
+
+    # Uniformly sample outer k-space.
+    # This is nominal R; actual acceleration may differ slightly because ACS is fully sampled.
+    for i in range(num_pe):
+        if i < acs_start or i >= acs_end:
+            if (i - acs_start) % acceleration == 0:
+                mask[i] = 1.0
+
+    return mask
+
+
+def apply_mask(kspace: np.ndarray, mask_1d: np.ndarray) -> np.ndarray:
+    """
+    Apply a 1D phase-encoding mask to multicoil k-space.
+
+    kspace shape: [coils, height, width]
+    mask_1d shape: [height]
+    """
+    return kspace * mask_1d[None, :, None]
+
+
+def create_acs_mask(num_pe: int, acs_lines: int = 24) -> np.ndarray:
+    """Create 1D ACS mask."""
+    mask = np.zeros(num_pe, dtype=np.float32)
+    center = num_pe // 2
+    acs_start = center - acs_lines // 2
+    acs_end = acs_start + acs_lines
+    mask[acs_start:acs_end] = 1.0
+    return mask
+
+
+def writecfl(name: str, array: np.ndarray) -> None:
+    """
+    Write array to BART .cfl/.hdr format.
+
+    BART stores complex64 data in column-major order.
+    """
+    array = np.asarray(array, dtype=np.complex64)
+    shape = array.shape
+
+    with open(name + ".hdr", "w") as f:
+        f.write("# Dimensions\n")
+        f.write(" ".join(map(str, shape)) + "\n")
+
+    with open(name + ".cfl", "wb") as f:
+        array.T.tofile(f)
+
+
+def readcfl(name: str) -> np.ndarray:
+    """Read BART .cfl/.hdr file."""
+    with open(name + ".hdr", "r") as f:
+        lines = f.readlines()
+
+    shape_line = None
+    for line in lines:
+        if not line.startswith("#") and line.strip():
+            shape_line = line
+            break
+
+    if shape_line is None:
+        raise RuntimeError(f"Could not read BART header: {name}.hdr")
+
+    shape = tuple(int(x) for x in shape_line.strip().split())
+    data = np.fromfile(name + ".cfl", dtype=np.complex64)
+
+    return data.reshape(shape[::-1]).T
+
+
+def estimate_sens_maps_sigpy(kspace: np.ndarray) -> np.ndarray:
+    """
+    Estimate coil sensitivity maps using SigPy ESPIRiT (Pure Python alternative to BART).
+
+    Input kspace shape:
+        [coils, height, width]
+    """
+    try:
+        import sigpy.mri as sigmri
+    except ImportError:
+        raise RuntimeError("sigpy is required. Install it using: pip install sigpy")
+
+    print("Estimating sensitivity maps with SigPy ESPIRiT...")
+    # SigPy expects [coils, ..., phase, readout] which matches [coils, height, width]
+    sens = sigmri.app.EspiritCalib(kspace, show_pbar=False).run()
+    
+    # Ensure complex64 for consistency
+    return sens.astype(np.complex64)
+
+
+def process_file(
+    input_h5: Path,
+    output_dir: Path,
+    acceleration: int = 4,
+    acs_lines: int = 24,
+    num_slices: int = 5,
+    slice_idx: int = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(input_h5, "r") as hf:
+        if "kspace" not in hf:
+            raise KeyError("The input h5 file does not contain a 'kspace' dataset.")
+
+        kspace_all = hf["kspace"][()]  # usually [slices, coils, height, width]
+
+        attrs = dict(hf.attrs)
+
+    if kspace_all.ndim != 4:
+        raise ValueError(f"Expected kspace shape [slices, coils, height, width], got {kspace_all.shape}")
+
+    num_total_slices, num_coils, height, width = kspace_all.shape
+
+    if slice_idx is not None:
+        selected_slices = [slice_idx]
+    else:
+        # Select central slices.
+        center_slice = num_total_slices // 2
+        half = num_slices // 2
+        start = max(center_slice - half, 0)
+        end = min(start + num_slices, num_total_slices)
+        selected_slices = list(range(start, end))
+
+    print(f"Input file: {input_h5}")
+    print(f"k-space shape: {kspace_all.shape}")
+    print(f"Selected slices: {selected_slices}")
+
+    # Phase-encoding dimension is assumed to be height.
+    num_pe = height
+
+    omega_mask_1d = create_uniform_mask(
+        num_pe=num_pe,
+        acceleration=acceleration,
+        acs_lines=acs_lines,
+    )
+
+    acs_mask_1d = create_acs_mask(
+        num_pe=num_pe,
+        acs_lines=acs_lines,
+    )
+
+    actual_acceleration = num_pe / np.sum(omega_mask_1d)
+
+    print(f"Nominal R = {acceleration}")
+    print(f"Actual R ≈ {actual_acceleration:.3f}")
+    print(f"ACS lines = {acs_lines}")
+
+    for slice_id in selected_slices:
+        print(f"Processing slice {slice_id}...")
+
+        kspace_full = kspace_all[slice_id].astype(np.complex64)  # [coils, height, width]
+
+        # Apply acquisition mask Ω.
+        kspace_under = apply_mask(kspace_full, omega_mask_1d).astype(np.complex64)
+
+        # For realistic sensitivity maps, estimate from undersampled k-space with ACS.
+        # Using SigPy ESPIRiT (pure Python) instead of BART.
+        sens_maps = estimate_sens_maps_sigpy(kspace_under)
+
+        # Reference image for evaluation only.
+        coil_imgs_full = ifft2c(kspace_full)
+        target_rss = rss_combine(coil_imgs_full).astype(np.float32)
+
+        # Zero-filled reconstruction for sanity check.
+        coil_imgs_zf = ifft2c(kspace_under)
+        zf_rss = rss_combine(coil_imgs_zf).astype(np.float32)
+
+        # Convert 1D mask to 2D mask for convenience.
+        omega_mask_2d = np.repeat(omega_mask_1d[:, None], width, axis=1).astype(np.float32)
+        acs_mask_2d = np.repeat(acs_mask_1d[:, None], width, axis=1).astype(np.float32)
+
+        # Rearrange axes from [coils, height, width] to [height, width, coils] to match ZS-SSL expectations
+        kspace_zs = np.transpose(kspace_full, (1, 2, 0))
+        sens_maps_zs = np.transpose(sens_maps, (1, 2, 0))
+
+        out_name = f"{input_h5.stem}_slice{slice_id:03d}_R{acceleration}_ACS{acs_lines}.mat"
+        out_path = output_dir / out_name
+
+        savemat(
+            out_path,
+            {
+                # Main reconstruction data required by zs_ssl_recon.ipynb
+                "kspace": kspace_zs,
+                "sens_maps": sens_maps_zs,
+                "mask": omega_mask_2d,
+
+                # Extra data (not strictly required by zs_ssl_recon.ipynb, but good for reference)
+                "kspace_under": np.transpose(kspace_under, (1, 2, 0)),
+                "omega_mask_1d": omega_mask_1d,
+                "acs_mask": acs_mask_2d,
+                "acs_mask_1d": acs_mask_1d,
+
+                # References / sanity checks
+                "target_rss": target_rss,
+                "zf_rss": zf_rss,
+
+                # Metadata
+                "slice_id": np.array([slice_id], dtype=np.int32),
+                "acceleration_nominal": np.array([acceleration], dtype=np.float32),
+                "acceleration_actual": np.array([actual_acceleration], dtype=np.float32),
+                "acs_lines": np.array([acs_lines], dtype=np.int32),
+                "num_coils": np.array([num_coils], dtype=np.int32),
+            },
+            do_compression=True,
+        )
+
+        print(f"Saved: {out_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, required=True, help="Path to fastMRI .h5 file.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save .mat files.")
+    parser.add_argument("--acceleration", type=int, default=4, help="Nominal acceleration factor.")
+    parser.add_argument("--acs_lines", type=int, default=24, help="Number of fully sampled ACS lines.")
+    parser.add_argument("--num_slices", type=int, default=5, help="Number of central slices to process (if slice_idx is not set).")
+    parser.add_argument("--slice_idx", type=int, default=None, help="Explicitly extract a specific slice index.")
+
+    args = parser.parse_args()
+
+    process_file(
+        input_h5=Path(args.input),
+        output_dir=Path(args.output_dir),
+        acceleration=args.acceleration,
+        acs_lines=args.acs_lines,
+        num_slices=args.num_slices,
+        slice_idx=args.slice_idx
+    )
+
+
+if __name__ == "__main__":
+    main()
